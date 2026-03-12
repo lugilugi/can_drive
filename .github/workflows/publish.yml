@@ -2,6 +2,7 @@ name: Publish to ESP Registry
 
 # This tells GitHub to run this script ONLY when you push a new version tag (e.g., v1.0.0)
 on:
+  workflow_dispatch:
   push:
     tags:
       - 'v*.*.*'
@@ -16,7 +17,6 @@ jobs:
       - name: Upload to ESP Component Registry
         uses: espressif/upload-components-ci-action@v2
         with:
-          # Change these to match your namespace and component name!
           namespace: "lugilugi" 
-          name: "can_driver"
+          components: "can_driver:."
           api_token: ${{ secrets.IDF_COMPONENT_API_TOKEN }}
