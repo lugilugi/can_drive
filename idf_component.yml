@@ -1,0 +1,8 @@
+# can_driver/idf_component.yml
+version: "1.0.0"
+description: "A non-blocking, pub/sub CAN (TWAI) driver using FreeRTOS queues."
+url: "https://github.com/YourGitHub/can_driver" # Optional but good practice
+license: "MIT" # Required for the public registry
+dependencies:
+  idf:
+    version: ">=5.0"
