@@ -1,0 +1,22 @@
+name: Publish to ESP Registry
+
+# This tells GitHub to run this script ONLY when you push a new version tag (e.g., v1.0.0)
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  upload_component:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Upload to ESP Component Registry
+        uses: espressif/upload-components-action@v1
+        with:
+          # Change these to match your namespace and component name!
+          namespace: "lugilugi" 
+          name: "can_driver"
+          api_token: ${{ secrets.IDF_COMPONENT_API_TOKEN }}
