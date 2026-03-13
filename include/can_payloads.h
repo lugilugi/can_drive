@@ -50,22 +50,19 @@ static inline bool PedalPayload_isBrakePressed(const PedalPayload* p) {
 // B. AUX CONTROL PAYLOAD (1 Byte)
 // ===================================================================================
 // Uses bit-fields to pack 8 boolean states into a single byte for lights/accessories.
-typedef struct {
+typedef union {
+    struct {
+        uint8_t left_turn    : 1; // Bit 0
+        uint8_t right_turn   : 1; // Bit 1
+        uint8_t brake_light  : 1; // Bit 2
+        uint8_t headlights   : 1; // ...
+        uint8_t hazards      : 1;
+        uint8_t horn         : 1;
+        uint8_t wipers       : 1;
+        uint8_t reserved     : 1; 
+    };
     uint8_t raw;
 } AuxControlPayload;
-
-#define AUX_LEFT_TURN    (1 << 0)
-#define AUX_RIGHT_TURN   (1 << 1)
-#define AUX_BRAKE_LIGHT  (1 << 2)
-#define AUX_HEADLIGHTS   (1 << 3)
-#define AUX_HAZARDS      (1 << 4)
-#define AUX_HORN         (1 << 5)
-#define AUX_WIPERS       (1 << 6)
-
-static inline void AuxControlPayload_clear(AuxControlPayload* p) { p->raw = 0; }
-static inline void AuxControlPayload_set(AuxControlPayload* p, uint8_t flag)    { p->raw |=  flag; }
-static inline void AuxControlPayload_clear_flag(AuxControlPayload* p, uint8_t flag) { p->raw &= ~flag; }
-static inline bool AuxControlPayload_get(const AuxControlPayload* p, uint8_t flag)  { return (p->raw & flag) != 0; }
 
 // ===================================================================================
 // C. POWER PAYLOAD (4 Bytes)

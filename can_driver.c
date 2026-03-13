@@ -1,217 +1,211 @@
 #include "can_driver.h"
 #include "esp_log.h"
-#include "freertos/semphr.h"
+#include <string.h>
 
-static const char* TAG = "CAN";
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+
+static const char* TAG = "CAN_DRV";
+
+// Notification bits for precise state machine transitions
+#define NOTIFY_BUS_OFF      (1 << 0)
+#define NOTIFY_BUS_ACTIVE   (1 << 1)
+
+// Wrapper to ensure deep copy of data in the Tx queue
+typedef struct {
+    twai_frame_t frame;
+    uint8_t data[8]; 
+} CanTxItem_t;
+
+// Routing Map
+typedef struct { uint32_t can_id; size_t offset; uint8_t len; HBIndex_t hb; } CanRoute_t;
+static const CanRoute_t ROUTE_TABLE[] = {
+    { CAN_ID_PEDAL, offsetof(VehicleDB_t, pedal), sizeof(PedalPayload), HB_PEDAL },
+    { CAN_ID_AUX_CTRL, offsetof(VehicleDB_t, aux), sizeof(AuxControlPayload), HB_AUX },
+    { CAN_ID_PWR_MONITOR_780, offsetof(VehicleDB_t, pwr_780), sizeof(PowerPayload), HB_PWR_780 },
+    { CAN_ID_PWR_MONITOR_740, offsetof(VehicleDB_t, pwr_740), sizeof(PowerPayload), HB_PWR_740 },
+    { CAN_ID_PWR_ENERGY, offsetof(VehicleDB_t, energy), 5, HB_ENERGY }
+};
+#define ROUTE_COUNT (sizeof(ROUTE_TABLE) / sizeof(CanRoute_t))
+
+static VehicleDB_t v_db = {0};
+static portMUX_TYPE db_mux = portMUX_INITIALIZER_UNLOCKED;
+static can_rx_hook_t app_hook = NULL;
+
+static twai_node_handle_t node_hdl = NULL;
+static QueueHandle_t tx_queue = NULL;
+static TaskHandle_t tx_task_handle = NULL;
+static TaskHandle_t recovery_task_handle = NULL;
 static bool is_running = false;
 
-// --- Topic & Fan-Out Routing State ---
-#define MAX_CAN_TOPICS 32        // Max unique CAN IDs the network can route
-#define MAX_SUBS_PER_TOPIC 4     // Max application tasks that can listen to a single ID
+esp_err_t can_driver_deinit(void) {
+    if (!is_running && !node_hdl && !tx_queue) return ESP_OK;
 
-typedef struct {
-    uint32_t can_id;
-    QueueHandle_t subscribers[MAX_SUBS_PER_TOPIC];
-    uint8_t sub_count;
-} CanTopic_t;
+    if (node_hdl) {
+        esp_err_t ret = twai_node_disable(node_hdl); //
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "Node disable failed: %s", esp_err_to_name(ret));
+        }
+    }
 
-static CanTopic_t topic_table[MAX_CAN_TOPICS];
-static uint8_t topic_count = 0;
-static SemaphoreHandle_t router_mutex = NULL; // Protects the table during subscription
-static TaskHandle_t tx_task_handle = NULL;
+    if (tx_task_handle) vTaskDelete(tx_task_handle);
+    if (recovery_task_handle) vTaskDelete(recovery_task_handle);
+    if (node_hdl) twai_node_delete(node_hdl); //
+    if (tx_queue) vQueueDelete(tx_queue);
 
-// --- Background TX State ---
-static QueueHandle_t tx_queue = NULL;
+    tx_task_handle = NULL;
+    recovery_task_handle = NULL;
+    node_hdl = NULL;
+    tx_queue = NULL;
+    is_running = false;
+    return ESP_OK;
+}
 
 // ===================================================================================
-// BACKGROUND SYSTEM TASKS
+// INTERNAL HELPERS
 // ===================================================================================
 
-// 1. Hardware Fault Monitor: Watches the physical TWAI hardware for bus errors
-static void twai_monitor_task(void *arg) {
-    uint32_t alerts;
-    uint32_t alert_mask = TWAI_ALERT_BUS_OFF | TWAI_ALERT_BUS_RECOVERED | 
-                          TWAI_ALERT_RX_QUEUE_FULL | TWAI_ALERT_TX_FAILED;
-    twai_reconfigure_alerts(alert_mask, NULL);
+static void configure_hardware_filter(const uint32_t* ids, size_t count) {
+    if (count == 0) return;
+    uint32_t c_ones = ids[0], c_zeros = ~ids[0] & 0x7FF;
+    for (size_t i = 1; i < count; i++) {
+        c_ones &= ids[i];
+        c_zeros &= (~ids[i] & 0x7FF);
+    }
+    // ESP-IDF v5.5.3 Logic: 1 = match exactly, 0 = ignore
+    uint32_t match_mask = (c_ones | c_zeros) & 0x7FF;
+    twai_mask_filter_config_t cfg = { .id = c_ones, .mask = match_mask, .is_ext = false };
+    ESP_ERROR_CHECK(twai_node_config_mask_filter(node_hdl, 0, &cfg)); // Must be called while disabled
+}
 
+// ===================================================================================
+// ISR CALLBACKS
+// ===================================================================================
+
+static bool twai_rx_cb(twai_node_handle_t handle, const twai_rx_done_event_data_t *edata, void *ctx) {
+    twai_frame_t rx;
+    uint8_t buf[8];
+    rx.buffer = buf;
+    rx.buffer_len = 8;
+
+    if (twai_node_receive_from_isr(handle, &rx) == ESP_OK) {
+        if (rx.header.fdf) return false; // Incompatible FD frames are treated as errors
+        if (app_hook) app_hook(&rx);
+
+        for (int i = 0; i < ROUTE_COUNT; i++) {
+            if (rx.header.id == ROUTE_TABLE[i].can_id) {
+                taskENTER_CRITICAL_ISR(&db_mux);
+                memcpy((uint8_t*)&v_db + ROUTE_TABLE[i].offset, rx.buffer, ROUTE_TABLE[i].len);
+                v_db.last_seen[ROUTE_TABLE[i].hb] = xTaskGetTickCountFromISR();
+                taskEXIT_CRITICAL_ISR(&db_mux);
+                break;
+            }
+        }
+    }
+    return false;
+}
+
+static bool twai_state_cb(twai_node_handle_t handle, const twai_state_change_event_data_t *edata, void *ctx) {
+    BaseType_t woken = pdFALSE;
+    if (recovery_task_handle == NULL) return false;
+
+    if (edata->new_sta == TWAI_ERROR_BUS_OFF) {
+        xTaskNotifyFromISR(recovery_task_handle, NOTIFY_BUS_OFF, eSetBits, &woken);
+    } else if (edata->new_sta == TWAI_ERROR_ACTIVE) {
+        xTaskNotifyFromISR(recovery_task_handle, NOTIFY_BUS_ACTIVE, eSetBits, &woken);
+    }
+    return woken == pdTRUE;
+}
+
+// ===================================================================================
+// TASKS
+// ===================================================================================
+
+static void recovery_task(void *arg) {
+    uint32_t delay = 100, bits;
     while (1) {
-        // Block until an alert fires (0% CPU usage while waiting)
-        if (twai_read_alerts(&alerts, portMAX_DELAY) == ESP_OK) {
-            
-            // Critical Fault: Hardware disabled itself due to wiring/EMI issues
-            if (alerts & TWAI_ALERT_BUS_OFF) {
-                ESP_LOGE(TAG, "Bus-Off! Initiating recovery...");
-                // NULL guard before suspend
-                if (tx_task_handle != NULL) {
-                    vTaskSuspend(tx_task_handle);
-                }
-                twai_initiate_recovery();
+        // Wait specifically for BUS_OFF bit and clear on exit
+        xTaskNotifyWait(0, NOTIFY_BUS_OFF | NOTIFY_BUS_ACTIVE, &bits, portMAX_DELAY);
+        if (!(bits & NOTIFY_BUS_OFF)) continue; // Spurious wakeup, ignore
+
+        ESP_LOGE(TAG, "Bus-Off! Suspending TX and waiting %lu ms", delay);
+        vTaskSuspend(tx_task_handle);
+        vTaskDelay(pdMS_TO_TICKS(delay));
+        xQueueReset(tx_queue);
+        
+        // Non-blocking recovery initiation
+        if (twai_node_recover(node_hdl) == ESP_OK) {
+            // Wait for BUS_ACTIVE bit to ensure hardware is back online
+            TickType_t timeout = pdMS_TO_TICKS(5000);
+            if (xTaskNotifyWait(0, NOTIFY_BUS_ACTIVE, &bits, timeout) == pdFALSE || 
+                !(bits & NOTIFY_BUS_ACTIVE)) {
+                ESP_LOGE(TAG, "Recovery timed out. Bus may be physically damaged.");
+                delay = (delay * 2 > 5000) ? 5000 : delay * 2;
+                xTaskNotify(xTaskGetCurrentTaskHandle(), NOTIFY_BUS_OFF, eSetBits);
+                continue;
             }
-            if (alerts & TWAI_ALERT_BUS_RECOVERED) {
-                ESP_LOGI(TAG, "Bus Recovered!");
-                twai_start();
-                // Flush stale commands before resuming
-                xQueueReset(tx_queue);
-                if (tx_task_handle != NULL) {
-                    vTaskResume(tx_task_handle);
-                }
-            }
-            // Warning: The dispatch_task isn't reading data fast enough
-            if (alerts & TWAI_ALERT_RX_QUEUE_FULL) {
-                ESP_LOGE(TAG, "Hardware RX Queue Full! Dropping messages.");
-            }
+            ESP_LOGI(TAG, "Bus Recovered. Resuming TX.");
+            vTaskResume(tx_task_handle);
+            delay = 100; // Reset backoff on success
+        } else {
+            delay = (delay * 2 > 5000) ? 5000 : delay * 2;
+            // Retry recovery on next loop by setting BUS_OFF bit
+            xTaskNotify(xTaskGetCurrentTaskHandle(), NOTIFY_BUS_OFF, eSetBits); 
         }
     }
 }
 
-// 2. Transmit Task: Drains the software queue onto the physical bus
 static void tx_task(void* arg) {
-    twai_message_t tx_msg;
-    while(1) {
-        // Wait for an app task to push a message via CAN_PUBLISH
-        if (xQueueReceive(tx_queue, &tx_msg, portMAX_DELAY) == pdTRUE) {
-            
-            // Attempt to send. Gives the hardware up to 50ms to win arbitration 
-            // if the physical bus is heavily congested.
-            esp_err_t res = twai_transmit(&tx_msg, pdMS_TO_TICKS(50));
-            if (res != ESP_OK) {
-                ESP_LOGE("CAN_TX", "Hardware TX Failed ID 0x%lX: %s", 
-                         tx_msg.identifier, esp_err_to_name(res));
-            }
-        }
-    }
-}
-
-// 3. Receive Router: Grabs messages off the wire and fans them out to app tasks
-static void dispatch_task(void* arg) {
-    twai_message_t rx_msg;
-    while(1) {
-        if (twai_receive(&rx_msg, portMAX_DELAY) == ESP_OK) {
-            
-            xSemaphoreTake(router_mutex, portMAX_DELAY);
-            
-            // Search the routing table for a matching topic
-            for (int i = 0; i < topic_count; i++) {
-                if (topic_table[i].can_id == rx_msg.identifier) {
-                    
-                    // FAN-OUT: Push a copy to every task that subscribed to this ID.
-                    // A timeout of 0 prevents a stalled app task from freezing this router.
-                    for (int j = 0; j < topic_table[i].sub_count; j++) {
-                        xQueueSend(topic_table[i].subscribers[j], &rx_msg, 0);
-                    }
-                    break;
-                }
-            }
-            xSemaphoreGive(router_mutex);
-        }
+    CanTxItem_t item;
+    while(xQueueReceive(tx_queue, &item, portMAX_DELAY)) {
+        item.frame.buffer = item.data; 
+        twai_node_transmit(node_hdl, &item.frame, pdMS_TO_TICKS(10));
     }
 }
 
 // ===================================================================================
-// DRIVER IMPLEMENTATION
+// PUBLIC API
 // ===================================================================================
 
-esp_err_t can_driver_init(gpio_num_t tx_pin, gpio_num_t rx_pin, uint32_t baud_rate) {
+esp_err_t can_driver_init(gpio_num_t tx, gpio_num_t rx, uint32_t baud, const uint32_t* f_ids, size_t f_count) {
     if (is_running) return ESP_OK;
 
-    // Initialize OS primitives
-    router_mutex = xSemaphoreCreateMutex();
-    if (router_mutex == NULL) {
-        ESP_LOGE(TAG, "Failed to create router mutex");
-        return ESP_ERR_NO_MEM;
-    }
+    tx_queue = xQueueCreate(20, sizeof(CanTxItem_t));
+    if (!tx_queue) return ESP_ERR_NO_MEM;
 
-    tx_queue = xQueueCreate(20, sizeof(twai_message_t));
-    if (tx_queue == NULL) {
-        ESP_LOGE(TAG, "Failed to create TX queue");
-        vSemaphoreDelete(router_mutex);
-        return ESP_ERR_NO_MEM;
-    }
+    twai_onchip_node_config_t n_cfg = { .io_cfg.tx=tx, .io_cfg.rx=rx, .bit_timing.bitrate=baud, .tx_queue_depth=20 };
+    if (twai_new_node_onchip(&n_cfg, &node_hdl) != ESP_OK) return ESP_FAIL;
 
-    // Configure TWAI Hardware
-    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(tx_pin, rx_pin, TWAI_MODE_NORMAL);
-    g_config.tx_queue_len = 10; 
-    g_config.rx_queue_len = 20;
-    g_config.clk_src = TWAI_CLK_SRC_XTAL;
+    twai_event_callbacks_t cbs = { .on_rx_done = twai_rx_cb, .on_state_change = twai_state_cb };
+    twai_node_register_event_callbacks(node_hdl, &cbs, NULL); // Registered before enable
+    configure_hardware_filter(f_ids, f_count);
 
-    twai_timing_config_t t_config;
-    switch(baud_rate) {
-        case 1000000: t_config = (twai_timing_config_t)TWAI_TIMING_CONFIG_1MBITS(); break;
-        case 500000:  t_config = (twai_timing_config_t)TWAI_TIMING_CONFIG_500KBITS(); break;
-        case 250000:  t_config = (twai_timing_config_t)TWAI_TIMING_CONFIG_250KBITS(); break;
-        default: return ESP_ERR_INVALID_ARG;
-    }
-    
-    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+    // FIX: Handles are assigned BEFORE enable to ensure callbacks don't crash on initial state change
+    if (xTaskCreate(tx_task, "CAN_Tx", 4096, NULL, 9, &tx_task_handle) != pdPASS ||
+        xTaskCreate(recovery_task, "CAN_Rec", 2048, NULL, 11, &recovery_task_handle) != pdPASS) return ESP_FAIL;
 
-    ESP_ERROR_CHECK(twai_driver_install(&g_config, &t_config, &f_config));
-    ESP_ERROR_CHECK(twai_start());
-
-    // Start Core Tasks
-    // Monitor should preempt everything else to handle faults.
-    if (xTaskCreate(twai_monitor_task, "CAN_Mon", 2048, NULL, 6, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create monitor task");
-        return ESP_FAIL;
-    }
-    if (xTaskCreate(tx_task, "CAN_Tx", 4096, NULL, 5, &tx_task_handle) != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create TX task");
-        return ESP_FAIL;
-    }
-    if (xTaskCreate(dispatch_task, "CAN_Rx", 4096, NULL, 5, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create dispatch task");
-        return ESP_FAIL;
-    }
+    if (twai_node_enable(node_hdl) != ESP_OK) return ESP_FAIL;
 
     is_running = true;
-    ESP_LOGI(TAG, "Driver Started @ %lu bps", baud_rate);
     return ESP_OK;
 }
 
-esp_err_t can_subscribe(uint32_t id, QueueHandle_t rx_queue) {
-    if (rx_queue == NULL || router_mutex == NULL) return ESP_ERR_INVALID_ARG;
+void can_set_rx_hook(can_rx_hook_t hook) { app_hook = hook; }
 
-    xSemaphoreTake(router_mutex, portMAX_DELAY);
-
-    // 1. Attempt to add to an existing topic
-    for (int i = 0; i < topic_count; i++) {
-        if (topic_table[i].can_id == id) {
-            if (topic_table[i].sub_count < MAX_SUBS_PER_TOPIC) {
-                topic_table[i].subscribers[topic_table[i].sub_count++] = rx_queue;
-                xSemaphoreGive(router_mutex);
-                return ESP_OK;
-            } else {
-                xSemaphoreGive(router_mutex);
-                return ESP_ERR_NO_MEM; // Max tasks for this ID reached
-            }
-        }
-    }
-
-    // 2. Create a new topic if space allows
-    if (topic_count < MAX_CAN_TOPICS) {
-        topic_table[topic_count].can_id = id;
-        topic_table[topic_count].subscribers[0] = rx_queue;
-        topic_table[topic_count].sub_count = 1;
-        topic_count++;
-        xSemaphoreGive(router_mutex);
-        return ESP_OK;
-    }
-
-    xSemaphoreGive(router_mutex);
-    return ESP_ERR_NO_MEM; // Topic routing table is full
+void can_get_state_internal(size_t off, void* dst, size_t sz) {
+    taskENTER_CRITICAL(&db_mux);
+    memcpy(dst, (uint8_t*)&v_db + off, sz);
+    taskEXIT_CRITICAL(&db_mux);
 }
 
-esp_err_t can_send_message(uint32_t id, const uint8_t* data, uint8_t len) {
-    if (!is_running || tx_queue == NULL) return ESP_ERR_INVALID_STATE;
+bool can_is_stale(HBIndex_t idx, uint32_t ms) {
+    return (xTaskGetTickCount() - v_db.last_seen[idx]) > pdMS_TO_TICKS(ms);
+}
 
-    twai_message_t tx_msg = {.identifier = id, .data_length_code = len};
-    if (len > 8) return ESP_ERR_INVALID_ARG; // bounds check, TWAI max payload is 8 bytes
-    memcpy(tx_msg.data, data, len); 
-
-    // Non-blocking push to the background task queue
-    if (xQueueSend(tx_queue, &tx_msg, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "Software TX Queue Full! Dropping ID 0x%lX", id);
-        return ESP_FAIL;
-    }
-    
-    return ESP_OK;
+esp_err_t can_publish(uint32_t id, const void* pld, uint8_t len) {
+    if (len > 8 || !tx_queue) return ESP_ERR_INVALID_ARG;
+    CanTxItem_t item = { .frame = { .header.id = id, .header.fdf = false, .buffer_len = len } };
+    memcpy(item.data, pld, len); 
+    return xQueueSend(tx_queue, &item, 0) == pdTRUE ? ESP_OK : ESP_FAIL;
 }

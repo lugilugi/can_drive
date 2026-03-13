@@ -1,4 +1,4 @@
-# can_drive
+# can_driver
 
 ## ECT CAN Driver for ESP32
 
@@ -6,7 +6,7 @@ This component abstracts the ESP32's TWAI peripheral into a robust Publisher/Sub
 
 ---
 
-### 🌟 Key Features
+## 🌟 Key Features
 
 - **Non-Blocking Architecture:** Uses FreeRTOS queues for background TX/RX. Your main code never hangs waiting for the CAN bus.
 - **Topic-Based Routing:** Multiple tasks can subscribe to the same CAN ID (fan-out).
@@ -27,67 +27,138 @@ Or add it to your `idf_component.yml`:
 
 ```yaml
 dependencies:
-  lugilugi/can_driver: "^1.0.0"
+    lugilugi/can_driver: "^1.0.0"
 ```
 
 ---
 
-## 📖 Usage Overview
+## 📖 API Reference
 
-### 1. Header Files
+### Header Files
 
-- **can_driver.h:** Contains the API and macros you'll use in your tasks.
-- **can_messages.h:** The "Source of Truth" for CAN IDs and data packing. All nodes must use the same version.
+- **can_driver.h:** Main API and macros for CAN driver usage.
+- **can_payloads.h:** CAN message IDs and payload packing/unpacking helpers.
 
-### 2. Initializing the Bus
+---
 
-Call this once in your `app_main`. It handles hardware setup and spins up background monitoring tasks.
+### Driver Lifecycle
+
+#### `esp_err_t can_driver_init(gpio_num_t tx_pin, gpio_num_t rx_pin, uint32_t baud, const uint32_t* filter_ids, size_t id_count);`
+
+- Initializes the CAN driver and internal tasks.
+- Parameters:
+    - `tx_pin`: GPIO for CAN TX
+    - `rx_pin`: GPIO for CAN RX
+    - `baud`: CAN bus baud rate (e.g., 500000)
+    - `filter_ids`: Optional array of CAN IDs to filter (NULL for all)
+    - `id_count`: Number of IDs in filter_ids
+- Returns `ESP_OK` on success.
+
+#### `esp_err_t can_driver_deinit(void);`
+
+- Stops the node, deletes tasks, and frees memory.
+- Safe to call before re-initializing.
+
+---
+
+### Data Access & Interaction
+
+#### `esp_err_t can_publish(uint32_t id, const void* payload, uint8_t len);`
+
+- Non-blocking publish to the CAN bus.
+- Enforces Classic CAN constraints (max 8 bytes, no FD).
+- Returns `ESP_OK` if queued, `ESP_FAIL` otherwise.
+
+#### `void can_get_state_internal(size_t offset, void* dest, size_t size);`
+
+- Internal backend for the `CAN_GET_STATE` macro.
+- Copies the latest received data for a field from the global vehicle database.
+
+#### `#define CAN_GET_STATE(field, dest_ptr)`
+
+- Macro for type-safe state retrieval.
+- Example: `CAN_GET_STATE(pedal, &my_pedal)`
+
+#### `void can_set_rx_hook(can_rx_hook_t hook);`
+
+- Registers a callback for raw frame monitoring (e.g., SD logging).
+- Runs in ISR context; must not block.
+
+#### `bool can_is_stale(HBIndex_t index, uint32_t timeout_ms);`
+
+- Checks if a specific node's data is older than the specified timeout.
+- Returns true if stale.
+
+---
+
+### Data Structures
+
+#### `VehicleDB_t`
 
 ```c
-#include "can_driver.h"
-
-void app_main() {
-    // Parameters: TX GPIO, RX GPIO, Baud Rate
-    can_driver_init(GPIO_NUM_5, GPIO_NUM_4, 500000);
-}
+typedef struct {
+        PedalPayload      pedal;      // Latest throttle/brake state
+        AuxControlPayload aux;        // Latest lights/accessories state
+        PowerPayload      pwr_780;    // High-current traction system data
+        PowerPayload      pwr_740;    // Low-current auxiliary system data
+        EnergyPayload     energy;     // 40-bit energy accumulator data
+        uint32_t          last_seen[HB_MAX]; // Tick counts of last received messages
+} VehicleDB_t;
 ```
 
-### 3. Publishing Data (Sender)
+#### `HBIndex_t`
 
-To send data, use the `CAN_PUBLISH` macro. It pushes your data into a software queue immediately, letting your sensor task move on while hardware handles wire timing.
+Heartbeat tracking indices for node health:
 
 ```c
-PedalPayload my_data;
-PedalPayload_set(&my_data, 75.5, false); // 75.5% throttle, no brake
-
-CAN_PUBLISH(CAN_ID_PEDAL, &my_data);
+typedef enum {
+        HB_PEDAL = 0,
+        HB_AUX,
+        HB_PWR_780,
+        HB_PWR_740,
+        HB_ENERGY,
+        HB_MAX
+} HBIndex_t;
 ```
 
-### 4. Subscribing to Data (Receiver)
+#### `can_rx_hook_t`
 
-The driver uses a Topic Router. You create a local queue and subscribe it to a specific CAN ID.
+Callback type for frame monitoring:
 
 ```c
-QueueHandle_t pedal_q;
-PedalPayload rx_pedal;
-
-// Create a queue and subscribe it to CAN_ID_PEDAL
-CAN_SUBSCRIBE_TOPIC(CAN_ID_PEDAL, &pedal_q, 5);
-
-while(1) {
-    // Wait for data with a timeout (safety first!)
-    if (CAN_RECEIVE(pedal_q, &rx_pedal, 100)) {
-        float throttle = PedalPayload_getThrottle(&rx_pedal);
-        printf("Driving at %.1f%%\n", throttle);
-    }
-}
+typedef void (*can_rx_hook_t)(const twai_frame_t* frame);
 ```
 
 ---
 
-## 💡 Example Application
+### Payload Packing Helpers
 
-See `examples/basic_test/main/main.c` for a complete working demo with simulated pedal and motor controller tasks.
+See `can_payloads.h` for detailed packing/unpacking functions:
+
+- **PedalPayload**
+    - `PedalPayload_set(PedalPayload* p, float throttlePercent, bool brakePressed)`
+    - `float PedalPayload_getThrottle(const PedalPayload* p)`
+    - `bool PedalPayload_isBrakePressed(const PedalPayload* p)`
+
+- **AuxControlPayload**
+    - Bitfields for lights, wipers, horn, etc.
+
+- **PowerPayload**
+    - `PowerPayload_setRaw(PowerPayload* p, uint16_t raw_volts, int16_t raw_amps)`
+    - `float PowerPayload_getVoltage(const PowerPayload* p)`
+    - `float PowerPayload_getCurrent_780(const PowerPayload* p)`
+    - `float PowerPayload_getCurrent_740(const PowerPayload* p)`
+
+- **EnergyPayload**
+    - `EnergyPayload_setRaw(EnergyPayload* p, uint64_t raw_energy_reg)`
+    - `double EnergyPayload_getJoules_780(const EnergyPayload* p)`
+    - `double EnergyPayload_getJoules_740(const EnergyPayload* p)`
+
+---
+
+## 🧑‍💻 Example Application
+
+See `examples/basic_test/main/main.c` for a complete working demo with simulated pedal and motor controller tasks. Each function demonstrates a feature of the API.
 
 ---
 

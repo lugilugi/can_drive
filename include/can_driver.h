@@ -1,83 +1,83 @@
 #pragma once
 
-#include "driver/twai.h"
-#include "driver/gpio.h"
-#include "esp_err.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
-#include <string.h>
-
-// ===================================================================================
-// INITIALIZATION API
-// ===================================================================================
+#include "esp_twai.h"
+#include "esp_twai_onchip.h"
+#include "can_payloads.h"
 
 /**
- * @brief Initializes the ESP32 TWAI controller and starts background routing tasks.
- * @param tx_pin GPIO pin connected to the CAN Transceiver TX
- * @param rx_pin GPIO pin connected to the CAN Transceiver RX
- * @param baud_rate Usually 500000 (500kbps) or 1000000 (1Mbps)
- * @return ESP_OK on success
+ * @brief Heartbeat Tracking Indices
+ * These map to the last_seen array in the database to track node health.
  */
-esp_err_t can_driver_init(gpio_num_t tx_pin, gpio_num_t rx_pin, uint32_t baud_rate);
-
-// ===================================================================================
-// APPLICATION ABSTRACTION MACROS
-// ===================================================================================
-// Use these macros in your application code. They hide the complexity of FreeRTOS 
-// queues and raw memory copies.
+typedef enum { 
+    HB_PEDAL = 0, 
+    HB_AUX, 
+    HB_PWR_780, 
+    HB_PWR_740, 
+    HB_ENERGY, 
+    HB_MAX 
+} HBIndex_t;
 
 /**
- * @brief Thread-safe, non-blocking publish. Instantly pushes data to a background 
- * TX queue so your sensor tasks never freeze waiting for the bus.
- * @param id The CAN Msg ID (e.g., CAN_ID_PEDAL)
- * @param payload_ptr Pointer to the struct containing the payload
- * @usage CAN_PUBLISH(CAN_ID_PEDAL, &my_pedal_data);
+ * @brief Shared Vehicle State Database
+ * This struct represents the most recent state of the vehicle.
+ * Instead of tasks waiting on queues, they "pull" data from here.
  */
-#define CAN_PUBLISH(id, payload_ptr) \
-    can_send_message((id), (const uint8_t*)(payload_ptr), sizeof(*(payload_ptr)))
+typedef struct {
+    PedalPayload      pedal;      // Latest throttle/brake state
+    AuxControlPayload aux;        // Latest lights/accessories state
+    PowerPayload      pwr_780;    // High-current traction system data
+    PowerPayload      pwr_740;    // Low-current auxiliary system data
+    EnergyPayload     energy;     // 40-bit energy accumulator data
+    uint32_t          last_seen[HB_MAX]; // Tick counts of last received messages
+} VehicleDB_t;
 
 /**
- * @brief Creates a receiving queue and registers it with the driver. If multiple 
- * tasks subscribe to the same ID, the driver automatically copies the message
- * to all of them (Fan-Out routing).
- * @param id The CAN Msg ID to listen for
- * @param queue_ptr Pointer to your QueueHandle_t variable
- * @param queue_len Maximum number of unread messages to hold before dropping new ones
- * @usage QueueHandle_t my_q; CAN_SUBSCRIBE_TOPIC(CAN_ID_PEDAL, &my_q, 5);
+ * @brief Function pointer type for the SD Logger or other "Listeners"
+ * NOTE: This hook is called within an ISR context.
  */
-#define CAN_SUBSCRIBE_TOPIC(id, que ue_ptr, queue_len) \
-    do { \
-        *(queue_ptr) = xQueueCreate((queue_len), sizeof(twai_message_t)); \
-        configASSERT(*(queue_ptr) != NULL); \
-        can_subscribe((id), *(queue_ptr)); \
-    } while(0)
+typedef void (*can_rx_hook_t)(const twai_frame_t* frame);
+
+// --- Driver Lifecycle ---
+
 /**
- * @brief Waits for a message on your queue and safely unpacks it into your struct.
- * If a message doesn't arrive within the timeout, it safely returns false.
- * @param queue_handle The queue you created with CAN_SUBSCRIBE_TOPIC
- * @param payload_ptr Pointer to the struct where data should be saved
- * @param timeout_ms Max time to wait (e.g., 100ms). Prevents stale data usage!
- * @return true if data arrived, false if it timed out.
- * @usage if (CAN_RECEIVE(my_q, &my_pedal_data, 100)) { ... }
+ * @brief Initialize the TWAI driver and internal tasks.
+ * Includes transactional cleanup; if any part of the init fails, 
+ * it calls deinit internally to prevent resource leaks.
  */
-#define CAN_RECEIVE(queue_handle, payload_ptr, timeout_ms) \
-    can_receive_payload((queue_handle), (void*)(payload_ptr), sizeof(*(payload_ptr)), (timeout_ms))
+esp_err_t can_driver_init(gpio_num_t tx_pin, gpio_num_t rx_pin, uint32_t baud, const uint32_t* filter_ids, size_t id_count);
 
+/**
+ * @brief Safely stop the node, delete tasks, and free memory.
+ */
+esp_err_t can_driver_deinit(void);
 
-// ===================================================================================
-// LOW-LEVEL INTERNAL FUNCTIONS
-// ===================================================================================
-// Do not call these directly in application code. They are exposed here so the 
-// macros above can use them.
-esp_err_t can_send_message(uint32_t id, const uint8_t* data, uint8_t len);
-esp_err_t can_subscribe(uint32_t id, QueueHandle_t rx_queue);
+// --- Data Access & Interaction ---
 
-static inline bool can_receive_payload(QueueHandle_t q, void* payload_ptr, size_t payload_size, uint32_t timeout_ms) {
-    twai_message_t rx_msg;
-    if (xQueueReceive(q, &rx_msg, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
-        if (rx_msg.data_length_code != payload_size) return false;
-        memcpy(payload_ptr, rx_msg.data, payload_size);
-        return true;
-    }
-    return false;
-}
+/**
+ * @brief Registers a callback for raw frame monitoring (e.g., SD logging).
+ */
+void can_set_rx_hook(can_rx_hook_t hook);
+
+/**
+ * @brief Checks if a specific node's data is older than the specified timeout.
+ */
+bool can_is_stale(HBIndex_t index, uint32_t timeout_ms);
+
+/**
+ * @brief Non-blocking publish to the CAN bus.
+ * Enforces Classic CAN constraints (max 8 bytes, no FD).
+ */
+esp_err_t can_publish(uint32_t id, const void* payload, uint8_t len);
+
+/**
+ * @brief Internal backend for the CAN_GET_STATE macro.
+ */
+void can_get_state_internal(size_t offset, void* dest, size_t size);
+
+/**
+ * @brief Macro for type-safe state retrieval.
+ * Uses offsetof to calculate the memory address within the global struct.
+ */
+#define CAN_GET_STATE(field, dest_ptr) \
+    can_get_state_internal(offsetof(VehicleDB_t, field), dest_ptr, sizeof(((VehicleDB_t*)0)->field))
+    
