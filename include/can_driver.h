@@ -5,6 +5,7 @@
 #include "freertos/task.h"
 #include <stdint.h>
 #include <stdbool.h>
+#include "hal/gpio_types.h"
 
 // =============================================================================
 // can_driver.h — TWAI hardware abstraction layer.
@@ -75,15 +76,22 @@ typedef struct {
 // Lifecycle
 // -----------------------------------------------------------------------------
 
-// Initialize the TWAI peripheral with the given flags and start the node.
-// Must be called once at startup, before can_manager_init().
-//
-// Returns:
-//   ESP_OK               — initialized and running.
-//   ESP_ERR_INVALID_STATE — already initialized.
-//   ESP_ERR_INVALID_ARG  — incompatible flag combination (e.g. loopback +
-//                          listen_only).
-esp_err_t can_driver_init(CanInitFlags_t flags);
+/**
+ * @brief Initialize the TWAI (CAN) peripheral and start the node.
+ * * Must be called once at startup, before can_manager_init().
+ *
+ * @param tx_io  The GPIO pin number mapped to the CAN Transceiver TX.
+ * @param rx_io  The GPIO pin number mapped to the CAN Transceiver RX.
+ * @param baud   The CAN bus baud rate in bits per second (e.g., 500000 for 500 kbps).
+ * @param flags  Initialization flags (loopback, listen_only, etc.).
+ *
+ * @return
+ * - ESP_OK:                Initialized and running.
+ * - ESP_ERR_INVALID_STATE: Already initialized.
+ * - ESP_ERR_INVALID_ARG:   Incompatible flag combination (e.g., loopback + 
+ * listen_only) or invalid GPIO selection.
+ */
+esp_err_t can_driver_init(gpio_num_t tx_io, gpio_num_t rx_io, uint32_t baud, CanInitFlags_t flags);
 
 // Disable and delete the TWAI node, releasing hardware resources.
 // Call can_manager_deinit() before this to stop the manager task first.

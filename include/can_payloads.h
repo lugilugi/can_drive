@@ -37,44 +37,61 @@ typedef enum {
 #pragma pack(push, 1)
 
 // -----------------------------------------------------------------------------
-// A. PEDAL PAYLOAD (2 Bytes / 16 Bits)
-// Layout: [15] Brake Flag | [14:0] 15-bit Throttle (0–32767)
-// Moving Brake to MSB allows for instant safety checks via bit-masking.
+// A. PEDAL PAYLOAD (6 Bytes)
+// Layout: 
+//   Bytes 0-1: [15] Kill Flag | [14:0] 15-bit Throttle (0–32767)
+//   Byte  2:   Bitfield flags (Deadman state, ADC fault, Calibration state)
+//   Byte  3:   Sequence counter (Detects dropped frames)
+//   Bytes 4-5: Raw ADC telemetry
 // -----------------------------------------------------------------------------
+
+#pragma pack(push, 1)
+
+typedef union {
+    struct {
+        uint8_t deadman_active   : 1; // Bit 0: 1 = Holding, 0 = Dropped
+        uint8_t adc_fault        : 1; // Bit 1: 1 = Sensor unplugged/I2C fail
+        uint8_t is_calibrating   : 1; // Bit 2: 1 = NVS calibration running
+        uint8_t reserved         : 5; // Bits 3-7: Unused
+    };
+    uint8_t pedalFlags;
+} PedalFlags_t;
+
 typedef struct {
-    uint16_t pedalData;
+    uint16_t filtered_throttle;     
+    PedalFlags_t flags;        
+    uint8_t seq_counter;       
+    uint16_t raw_throttle_adc; 
 } PedalPayload;
 
-static inline void PedalPayload_set(PedalPayload *p, float throttlePercent, bool brakePressed)
-{
-    // [1] Robust Clamping
-    if (throttlePercent > 100.0f) throttlePercent = 100.0f;
-    if (throttlePercent < 0.0f)   throttlePercent = 0.0f;  
+#pragma pack(pop)
 
-    // [2] Accurate 15-bit Scaling (0 - 32767)
-    // Adding 0.5f prevents truncation errors (e.g., 99.9% becoming 99%).
-    uint16_t t_bits = (uint16_t)((throttlePercent * 327.67f) + 0.5f);
+// -----------------------------------------------------------------------------
+// Pedal Payload Helpers (Receiver Side)
+// These allow the Dashboard or Motor Controller to easily decode the 6 bytes.
+// -----------------------------------------------------------------------------
 
-    // [3] Safe Bit Packing
-    // Masking throttle with 0x7FFF ensures it CANNOT bleed into the MSB.
-    uint16_t brake_bit = (brakePressed ? 0x8000 : 0x0000);
-    p->pedalData = brake_bit | (t_bits & 0x7FFF);
-}
-
-static inline void PedalPayload_setRaw(PedalPayload *p, uint16_t raw) {
-    p->pedalData = raw;
+static inline void PedalPayload_setRaw(PedalPayload *p, uint16_t control) {
+    p->filtered_throttle = control;
+    // Flags, sequence, and raw_adc are set directly in the producer task
 }
 
 static inline float PedalPayload_getThrottle(const PedalPayload *p)
 {
-    // Mask out the MSB (Brake) and divide by the 15-bit scale constant.
-    return (float)(p->pedalData & 0x7FFF) * (100.0f / 32767.0f); 
+    // Mask out the MSB (Kill Flag) and divide by the 15-bit scale constant.
+    return (float)(p->filtered_throttle & 0x7FFF) * (100.0f / 32767.0f); 
 }
 
-static inline bool PedalPayload_isBrakePressed(const PedalPayload *p)
+static inline uint16_t PedalPayload_getThrottleRaw(const PedalPayload *p)
 {
-    // Quick check of bit 15.
-    return (p->pedalData & 0x8000) != 0; 
+    // Return the pure 15-bit integer for direct PWM mapping
+    return (p->filtered_throttle & 0x7FFF); 
+}
+
+static inline bool PedalPayload_isKillActive(const PedalPayload *p)
+{
+    // Quick check of bit 15 (Hardware Interlock or Brake)
+    return (p->filtered_throttle & 0x8000) != 0; 
 }
 
 // -----------------------------------------------------------------------------

@@ -10,4 +10,5 @@ idf_component_register(
         esp_driver_twai
         freertos
         log
+        driver
 )

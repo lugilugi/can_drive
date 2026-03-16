@@ -172,7 +172,7 @@ static bool IRAM_ATTR on_error(twai_node_handle_t handle,
 // Public API
 // =============================================================================
 
-esp_err_t can_driver_init(CanInitFlags_t flags)
+esp_err_t can_driver_init(gpio_num_t tx, gpio_num_t rx, uint32_t baud, CanInitFlags_t flags)
 {
     if (s_node_hdl != NULL) {
         ESP_LOGE(TAG, "Already initialized — call can_driver_deinit() first");
@@ -209,9 +209,9 @@ esp_err_t can_driver_init(CanInitFlags_t flags)
     s_isr_rx_fail     = 0;
 
     twai_onchip_node_config_t node_cfg = {
-        .io_cfg.tx                = CAN_TX_GPIO,
-        .io_cfg.rx                = CAN_RX_GPIO,
-        .bit_timing.bitrate       = CAN_BAUD_RATE,
+        .io_cfg.tx                = tx,
+        .io_cfg.rx                = rx,
+        .bit_timing.bitrate       = baud,
         .tx_queue_depth           = CAN_TX_QUEUE_DEPTH,
         .fail_retry_cnt           = CAN_TX_RETRY_COUNT,
         .flags.enable_self_test   = (uint8_t)flags.self_test,
@@ -260,9 +260,9 @@ esp_err_t can_driver_init(CanInitFlags_t flags)
     }
 
     ESP_LOGI(TAG, "Initialized at %d bps [loopback=%d self_test=%d listen_only=%d no_rtr=%d] (TX=%d RX=%d)",
-             CAN_BAUD_RATE,
+             baud,
              flags.loopback, flags.self_test, flags.listen_only, flags.no_rtr,
-             CAN_TX_GPIO, CAN_RX_GPIO);
+             tx, rx);
     return ESP_OK;
 
 cleanup:

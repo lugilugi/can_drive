@@ -81,8 +81,8 @@ static void fail(CanTestID_t id, const char *reason)
 // --- CAN_TEST_PREINIT_GUARD --------------------------------------------------
 static void test_preinit_guard(void)
 {
-    uint8_t dummy = 0xAB;
-    esp_err_t ret = can_driver_transmit(CAN_ID_PEDAL, &dummy, 2);
+    uint8_t dummy = 0xA6;
+    esp_err_t ret = can_driver_transmit(CAN_ID_PEDAL, &dummy, sizeof(PedalPayload));
     if (ret == ESP_ERR_INVALID_STATE) {
         pass(CAN_TEST_PREINIT_GUARD);
     } else {
@@ -93,7 +93,7 @@ static void test_preinit_guard(void)
 // --- CAN_TEST_INVALID_FLAGS --------------------------------------------------
 static void test_invalid_flags(void)
 {
-    esp_err_t ret = can_driver_init((CanInitFlags_t){
+    esp_err_t ret = can_driver_init(GPIO_NUM_1, GPIO_NUM_1, 500000, (CanInitFlags_t){
         .loopback    = 1,
         .listen_only = 1,
     });
@@ -108,7 +108,7 @@ static void test_invalid_flags(void)
 // --- CAN_TEST_INIT_LOOPBACK --------------------------------------------------
 static void test_init_loopback(void)
 {
-    esp_err_t ret = can_driver_init((CanInitFlags_t){ .loopback = 1 });
+    esp_err_t ret = can_driver_init(GPIO_NUM_1, GPIO_NUM_1, 500000, (CanInitFlags_t){ .loopback = 1 });
     if (ret == ESP_OK) {
         pass(CAN_TEST_INIT_LOOPBACK);
     } else {
@@ -150,18 +150,24 @@ static void test_rx_timeout(void)
 // --- CAN_TEST_PEDAL_ROUNDTRIP ------------------------------------------------
 static void test_pedal_roundtrip(void)
 {
-    const float expected_throttle = 75.0f;
-    const bool  expected_brake    = true;
-
     memset(&g_can_pedal, 0, sizeof(g_can_pedal));
 
-    PedalPayload p;
-    PedalPayload_set(&p, expected_throttle, expected_brake);
+    // Setup expected values
+    const uint16_t expected_throttle_raw = 16383; // roughly 50% throttle
+    const bool     expected_kill_active  = true;
+    const uint8_t  expected_sequence     = 42;
+
+    // Construct the new 6-byte payload using filtered_throttle
+    PedalPayload p = {0};
+    p.filtered_throttle = (expected_kill_active ? 0x8000 : 0x0000) | (expected_throttle_raw & 0x7FFF);
+    p.flags.deadman_active = 0; // Simulated dropped deadman
+    p.seq_counter = expected_sequence;
+    p.raw_throttle_adc = 12000;
 
     can_driver_reset_isr_counters();
     
-    // FIX: Cast struct address to uint8_t array for TX
-    if (can_driver_transmit(CAN_ID_PEDAL, (const uint8_t*)&p.pedalData, sizeof(PedalPayload)) != ESP_OK) {
+    // Transmit exactly 6 bytes
+    if (can_driver_transmit(CAN_ID_PEDAL, (const uint8_t*)&p, sizeof(PedalPayload)) != ESP_OK) {
         fail(CAN_TEST_PEDAL_ROUNDTRIP, "TX failed"); return;
     }
     vTaskDelay(pdMS_TO_TICKS(MANAGER_SETTLE_MS));
@@ -170,16 +176,23 @@ static void test_pedal_roundtrip(void)
         fail(CAN_TEST_PEDAL_ROUNDTRIP, "State not updated — manager did not process frame"); return;
     }
     
-    // FIX: Use Bit-mask getters instead of raw struct members
-    float actual_throttle = PedalPayload_getThrottle(&g_can_pedal.data);
-    bool  actual_brake    = PedalPayload_isBrakePressed(&g_can_pedal.data);
+    // Use the new payload getter functions
+    uint16_t actual_throttle_raw = PedalPayload_getThrottleRaw(&g_can_pedal.data);
+    bool     actual_kill_active  = PedalPayload_isKillActive(&g_can_pedal.data);
 
-    if (!float_close(actual_throttle, expected_throttle, FLOAT_EPSILON * expected_throttle)) {
-        fail(CAN_TEST_PEDAL_ROUNDTRIP, "Throttle value outside tolerance"); return;
+    if (actual_throttle_raw != expected_throttle_raw) {
+        fail(CAN_TEST_PEDAL_ROUNDTRIP, "Throttle value mismatch"); return;
     }
-    if (actual_brake != expected_brake) {
-        fail(CAN_TEST_PEDAL_ROUNDTRIP, "Brake flag mismatch"); return;
+    if (actual_kill_active != expected_kill_active) {
+        fail(CAN_TEST_PEDAL_ROUNDTRIP, "Kill flag mismatch"); return;
     }
+    if (g_can_pedal.data.seq_counter != expected_sequence) {
+        fail(CAN_TEST_PEDAL_ROUNDTRIP, "Sequence counter mismatch"); return;
+    }
+    if (g_can_pedal.data.flags.deadman_active != 0) {
+        fail(CAN_TEST_PEDAL_ROUNDTRIP, "Bitfield flags mismatch"); return;
+    }
+    
     pass(CAN_TEST_PEDAL_ROUNDTRIP);
 }
 
@@ -201,7 +214,7 @@ static void test_aux_roundtrip(void)
         fail(CAN_TEST_AUX_ROUNDTRIP, "State not updated"); return;
     }
     
-    // FIX: Changed .ctrl to .raw to match the union layout
+    // FIX: Changed .ctrl to .data to match the union layout
     if (g_can_aux.data.headlights != 1 || g_can_aux.data.left_turn != 1) {
         fail(CAN_TEST_AUX_ROUNDTRIP, "Set bits mismatch"); return;
     }
@@ -378,8 +391,8 @@ static void test_deinit(void)
         fail(CAN_TEST_DEINIT, "can_driver_deinit() failed"); return;
     }
 
-    uint8_t dummy = 0;
-    if (can_driver_transmit(CAN_ID_PEDAL, &dummy, 2) != ESP_ERR_INVALID_STATE) {
+    uint8_t dummy = 0xFD; // Increased to 6 bytes
+    if (can_driver_transmit(CAN_ID_PEDAL, &dummy, sizeof(PedalPayload)) != ESP_ERR_INVALID_STATE) {
         fail(CAN_TEST_DEINIT, "Pre-init guard not restored after deinit"); return;
     }
     pass(CAN_TEST_DEINIT);

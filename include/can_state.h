@@ -33,7 +33,7 @@
 // CAN_ID_PEDAL (0x110) — Throttle and brake state from the pedal node.
 // -----------------------------------------------------------------------------
 typedef struct {
-    PedalPayload data;         // 2 byte (throttle + brake)
+    PedalPayload data;        
     TickType_t   last_rx_tick;
 } CanStatePedal_t;
 

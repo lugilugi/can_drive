@@ -6,13 +6,6 @@
 // =============================================================================
 
 // -----------------------------------------------------------------------------
-// Hardware
-// -----------------------------------------------------------------------------
-#define CAN_TX_GPIO             0       // TWAI TX GPIO pin
-#define CAN_RX_GPIO             1       // TWAI RX GPIO pin
-#define CAN_BAUD_RATE           500000  // 500 kbps — standard automotive rate
-
-// -----------------------------------------------------------------------------
 // TX Pool
 // Number of static frame slots available for in-flight transmissions.
 // A slot is held from twai_driver_transmit() until the on_tx_done ISR fires.
